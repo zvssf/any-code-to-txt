@@ -1,7 +1,8 @@
 import os
 import sys
+from datetime import datetime
 
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QFileSystemWatcher, QTimer
 from PySide6.QtGui import QFont, QPalette, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,18 +22,20 @@ from PySide6.QtWidgets import (
     QFrame,
     QAbstractItemView,
     QGraphicsOpacityEffect,
-    QGraphicsDropShadowEffect,  # ← ДОБАВИЛИ
+    QGraphicsDropShadowEffect,
 )
 
 # директории, которые не включаем в дерево
 IGNORE_DIRS = {
     ".git", ".idea", ".vscode", "node_modules", "venv",
     "__pycache__", ".hg", ".svn", ".mypy_cache", ".pytest_cache",
+    "dist", "build", "target"
 }
 
 
 class MainWindow(QMainWindow):
     FILE_SEPARATOR = "===END OF THE FILE==="
+
     def __init__(self):
         super().__init__()
 
@@ -43,6 +46,21 @@ class MainWindow(QMainWindow):
         self.total_dirs: int = 0
         self.selected_files: int = 0
         self.selected_groups_count: int = 0
+
+        # --- АВТО-РЕЖИМ ---
+        self.is_auto_running = False
+        
+        # Следильщик за файловой системой
+        self.watcher = QFileSystemWatcher(self)
+        # Подключаем сигналы изменения файлов и папок
+        self.watcher.directoryChanged.connect(self.on_fs_changed)
+        self.watcher.fileChanged.connect(self.on_fs_changed)
+
+        # Таймер задержки (debounce), чтобы не запускать экспорт 10 раз за секунду
+        self.debounce_timer = QTimer()
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(500)  # 0.5 секунды задержки
+        self.debounce_timer.timeout.connect(self.run_auto_export_task)
 
         self.setWindowTitle("AI Project Exporter")
         self.resize(1200, 760)
@@ -83,6 +101,18 @@ class MainWindow(QMainWindow):
 
         # начальное состояние кнопок экспорта
         self.update_export_buttons_state()
+
+    # -----------------------
+    # Логирование с временем
+    # -----------------------
+
+    def add_log(self, message: str) -> None:
+        """Добавляет сообщение в лог с текущим временем (секунды)."""
+        time_str = datetime.now().strftime("[%H:%M:%S]")
+        self.log.append(f"{time_str} {message}")
+        # Автопрокрутка вниз
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # -----------------------
     # Эффект плавного появления
@@ -146,9 +176,6 @@ class MainWindow(QMainWindow):
         self.btn_export = QPushButton("Папка для TXT")
         self.btn_export.setProperty("pill", True)
 
-        self.btn_settings = QPushButton("Настройки")
-        self.btn_settings.setProperty("pill_secondary", True)
-
         self.btn_project.clicked.connect(self.choose_project)
         self.btn_export.clicked.connect(self.choose_export_path)
 
@@ -157,7 +184,6 @@ class MainWindow(QMainWindow):
 
         buttons_box.addWidget(self.btn_project)
         buttons_box.addWidget(self.btn_export)
-        buttons_box.addWidget(self.btn_settings)
 
         layout.addLayout(left_box)
         layout.addStretch(1)
@@ -182,7 +208,7 @@ class MainWindow(QMainWindow):
         tree_title = QLabel("Структура проекта")
         tree_title.setProperty("section_title", True)
 
-        tree_hint = QLabel("Отметьте файлы и папки, которые хотите включить в экспорт.")
+        tree_hint = QLabel("Отметьте файлы, которые нужно отслеживать и экспортировать.")
         tree_hint.setObjectName("SectionHint")
 
         left_layout.addWidget(tree_title)
@@ -224,16 +250,25 @@ class MainWindow(QMainWindow):
         self.btn_run.setProperty("accent", True)
         self.btn_run.setFixedHeight(40)
         self.btn_run.clicked.connect(self.start_export_grouped)
-        self.btn_run.setToolTip("Ctrl+E — экспортировать выбранные файлы в несколько TXT по папкам")
+        self.btn_run.setToolTip("Ctrl+E — файлы по папкам")
 
-        self.btn_run_single = QPushButton("Экспорт в один файл")
+        self.btn_run_single = QPushButton("В один файл")
         self.btn_run_single.setProperty("secondary", True)
         self.btn_run_single.setFixedHeight(40)
         self.btn_run_single.clicked.connect(self.start_export_single)
-        self.btn_run_single.setToolTip("Ctrl+Shift+E — экспортировать выбранные файлы в один общий TXT")
+        self.btn_run_single.setToolTip("Ctrl+Shift+E — все в один TXT")
+
+        # --- КНОПКА АВТО ---
+        self.btn_auto = QPushButton("Авто-парсинг")
+        self.btn_auto.setProperty("secondary", True)
+        self.btn_auto.setCheckable(True)
+        self.btn_auto.setFixedHeight(40)
+        self.btn_auto.clicked.connect(self.toggle_auto_mode)
+        self.btn_auto.setToolTip("Режим наблюдения: следит за выбранными файлами и обновляет TXT")
 
         buttons_row.addWidget(self.btn_run, 1)
         buttons_row.addWidget(self.btn_run_single, 1)
+        buttons_row.addWidget(self.btn_auto, 1)
 
         self.progress = QProgressBar()
         self.progress.setValue(0)
@@ -271,10 +306,14 @@ class MainWindow(QMainWindow):
 
     def update_export_buttons_state(self) -> None:
         ready = self.is_ready_for_export()
-        for btn in (getattr(self, "btn_run", None), getattr(self, "btn_run_single", None)):
-            if not btn:
-                continue
-            btn.setEnabled(ready)
+        if self.is_auto_running:
+            self.btn_run.setEnabled(False)
+            self.btn_run_single.setEnabled(False)
+            self.btn_auto.setEnabled(True)
+        else:
+            self.btn_run.setEnabled(ready)
+            self.btn_run_single.setEnabled(ready)
+            self.btn_auto.setEnabled(ready)
 
     # -----------------------
     # Обновление информации (карточка справа)
@@ -294,6 +333,10 @@ class MainWindow(QMainWindow):
                 f"папок: {self.total_dirs}</span>"
             )
 
+        status_prefix = ""
+        if self.is_auto_running:
+            status_prefix = "<br><br><span style='color:#BF616A'><b>● ЗАПУЩЕН АВТО-РЕЖИМ (LIVE)</b></span>"
+
         text = (
             f"<b>Проект</b><br>"
             f"<span style='color:#F5F7FA'>{project}</span><br><br>"
@@ -302,6 +345,7 @@ class MainWindow(QMainWindow):
             f"<b>Выбрано файлов:</b> {files}<br>"
             f"<b>Групп (TXT по папкам):</b> {groups}"
             f"{extra}"
+            f"{status_prefix}"
         )
 
         self.card_info.setText(text)
@@ -315,7 +359,7 @@ class MainWindow(QMainWindow):
         if path:
             self.project_path = path
             self.statusBar().showMessage(f"Выбран проект: {path}")
-            self.log.append(f"[INFO] Проект выбран: {path}")
+            self.add_log(f"[INFO] Проект выбран: {path}")
             self.load_project_tree()
             self.update_export_buttons_state()
 
@@ -324,7 +368,7 @@ class MainWindow(QMainWindow):
         if path:
             self.export_path = path
             self.statusBar().showMessage(f"Папка TXT: {path}")
-            self.log.append(f"[INFO] Папка для TXT: {path}")
+            self.add_log(f"[INFO] Папка для TXT: {path}")
             self.update_summary()
             self.update_export_buttons_state()
 
@@ -365,7 +409,7 @@ class MainWindow(QMainWindow):
             f"Загружен проект: {self.project_path} "
             f"(файлов: {self.total_files}, папок: {self.total_dirs})"
         )
-        self.log.append(
+        self.add_log(
             f"[INFO] Загружен проект. Файлов: {self.total_files}, папок: {self.total_dirs}"
         )
 
@@ -376,7 +420,7 @@ class MainWindow(QMainWindow):
                 key=lambda e: (not e.is_dir(), e.name.lower())
             )
         except PermissionError:
-            self.log.append(f"[WARN] Нет доступа: {parent_path}")
+            self.add_log(f"[WARN] Нет доступа: {parent_path}")
             return
 
         for entry in entries:
@@ -509,7 +553,7 @@ class MainWindow(QMainWindow):
         self.update_summary()
 
     # -----------------------
-    # Сбор всех выбранных файлов (относительный + абсолютный путь)
+    # Сбор всех выбранных файлов
     # -----------------------
 
     def _collect_selected_files(self) -> list[tuple[str, str]]:
@@ -537,30 +581,7 @@ class MainWindow(QMainWindow):
         return result
 
     # -----------------------
-    # Формирование имени TXT-файла для группы
-    # -----------------------
-
-    def _make_group_filename(self, dir_key: str) -> str:
-        if dir_key in ("", ".", "(корень проекта)"):
-            base = os.path.basename(self.project_path.rstrip(os.sep)) or "root"
-        else:
-            base = dir_key.replace(os.sep, "-")
-
-        safe_chars = "-_.() []{}"
-        cleaned = []
-        for ch in base:
-            if ch.isalnum() or ch in safe_chars:
-                cleaned.append(ch)
-            else:
-                cleaned.append("_")
-        base_clean = "".join(cleaned).strip("._ ")
-        if not base_clean:
-            base_clean = "group"
-
-        return base_clean + ".txt"
-
-    # -----------------------
-    # Безопасное чтение файла (текст / бинарники)
+    # Безопасное чтение файла
     # -----------------------
 
     def _read_file_safe(self, path: str) -> tuple[str, bool]:
@@ -591,7 +612,7 @@ class MainWindow(QMainWindow):
             return f"<<Ошибка чтения файла: {e}>>", False
 
     # -----------------------
-    # Заголовок для TXT-файлов (инструкция для нейросетей)
+    # Заголовок для TXT-файлов
     # -----------------------
 
     def _write_export_header(self, out) -> None:
@@ -605,30 +626,160 @@ class MainWindow(QMainWindow):
             "- блоки разделяются строкой-маркером:\n"
             "  ===END OF THE FILE===\n"
             "\n"
-            "Пожалуйста, при анализе кода опирайся на путь файла и номера строк,\n"
-            "а маркер разделения воспринимай только как границу между файлами.\n"
-            "\n"
         )
 
     # -----------------------
-    # ЭКСПОРТ — ПО ГРУППАМ (как раньше)
+    # ЛОГИКА АВТО-РЕЖИМА
     # -----------------------
+
+    def toggle_auto_mode(self, checked: bool) -> None:
+        if checked:
+            # Включаем режим
+            if not self.is_ready_for_export():
+                self.btn_auto.setChecked(False)
+                self.statusBar().showMessage("Сначала выберите проект, папку TXT и файлы.")
+                return
+
+            self.is_auto_running = True
+            self.btn_auto.setText("Остановить")
+            self.btn_auto.setProperty("accent_danger", True) # Активируем красный стиль
+            self.add_log("[AUTO] 🔴 Слежение запущено. Мониторим выбранные файлы.")
+
+            # Блокируем выбор папок
+            self.btn_project.setEnabled(False)
+            self.btn_export.setEnabled(False)
+            self.tree.setEnabled(False)
+            self.btn_run.setEnabled(False)
+            self.btn_run_single.setEnabled(False)
+
+            # Настраиваем слежку
+            self.setup_watchers()
+
+            # Делаем первый прогон сразу
+            self.run_auto_export_task()
+
+        else:
+            # Выключаем режим
+            self.is_auto_running = False
+            self.btn_auto.setText("Авто-парсинг")
+            self.btn_auto.setProperty("accent_danger", False) # Возврат к обычному
+            self.add_log("[AUTO] ⚫ Слежение остановлено.")
+
+            self.btn_project.setEnabled(True)
+            self.btn_export.setEnabled(True)
+            self.tree.setEnabled(True)
+            self.update_export_buttons_state()
+
+            # Очищаем слежку
+            if self.watcher.files() or self.watcher.directories():
+                self.watcher.removePaths(self.watcher.files())
+                self.watcher.removePaths(self.watcher.directories())
+
+        self.update_summary()
+        # Принудительное обновление стиля кнопки
+        self.btn_auto.style().unpolish(self.btn_auto)
+        self.btn_auto.style().polish(self.btn_auto)
+
+    def setup_watchers(self) -> None:
+        """
+        УМНОЕ СЛЕЖЕНИЕ (ПО ФАЙЛАМ):
+        Мы добавляем в watcher конкретные файлы. Это работает точнее, чем папки.
+        """
+        # Сначала очистим старые пути
+        if self.watcher.files():
+            self.watcher.removePaths(self.watcher.files())
+        if self.watcher.directories():
+            self.watcher.removePaths(self.watcher.directories())
+
+        files = self._collect_selected_files()
+        
+        # Получаем список абсолютных путей выбранных файлов
+        file_paths = [abs_path for _, abs_path in files]
+
+        if file_paths:
+            self.watcher.addPaths(file_paths)
+            self.add_log(f"[AUTO] Под наблюдением: {len(file_paths)} файлов.")
+        else:
+            self.add_log("[WARN] Нет выбранных файлов для слежения.")
+
+    def on_fs_changed(self, path: str) -> None:
+        """Срабатывает при изменении файла."""
+        if not self.is_auto_running:
+            return
+
+        # ЗАЩИТА ОТ ЦИКЛА:
+        # Проверяем, является ли измененный файл нашим результатом
+        project_name = os.path.basename(self.project_path.rstrip(os.sep)) or "project"
+        target_name = project_name + "_all.txt"
+        target_full = os.path.normpath(os.path.join(self.export_path, target_name))
+        changed_full = os.path.normpath(path)
+
+        if changed_full == target_full:
+            # Игнорируем изменение самого файла отчета
+            return
+        
+        # ЗАЩИТА ОТ "АТОМАРНОГО СОХРАНЕНИЯ" (для VS Code и др.):
+        # Если файл был удален и создан заново (атомарное сохранение),
+        # QtWatcher может "потерять" его. Проверяем:
+        if not os.path.exists(changed_full):
+            # Файл исчез (удален). Ничего не делаем пока что.
+            pass
+        else:
+            # Файл существует. Проверим, следим ли мы за ним.
+            # Если редактор пересоздал файл, путь мог вылететь из watcher.files()
+            if changed_full not in [os.path.normpath(p) for p in self.watcher.files()]:
+                 self.watcher.addPath(changed_full)
+                 # self.add_log(f"[DEBUG] Переподключена слежка за: {os.path.basename(path)}")
+
+        # Запускаем таймер (debounce), чтобы объединить множество сохранений в одно действие
+        self.debounce_timer.start()
+
+    def run_auto_export_task(self) -> None:
+        """Фактическая задача экспорта (вызывается таймером)."""
+        if not self.is_auto_running:
+            return
+
+        self.statusBar().showMessage("Авто-парсинг: Обнаружены изменения, обновляю файл...")
+        self.start_export_single(is_auto=True)
+
+    # -----------------------
+    # ЭКСПОРТ — ПО ГРУППАМ
+    # -----------------------
+    
+    def _make_group_filename(self, dir_key: str) -> str:
+        if dir_key in ("", ".", "(корень проекта)"):
+            base = os.path.basename(self.project_path.rstrip(os.sep)) or "root"
+        else:
+            base = dir_key.replace(os.sep, "-")
+
+        safe_chars = "-_.() []{}"
+        cleaned = []
+        for ch in base:
+            if ch.isalnum() or ch in safe_chars:
+                cleaned.append(ch)
+            else:
+                cleaned.append("_")
+        base_clean = "".join(cleaned).strip("._ ")
+        if not base_clean:
+            base_clean = "group"
+
+        return base_clean + ".txt"
 
     def start_export_grouped(self) -> None:
         if not self.project_path:
             self.statusBar().showMessage("Сначала выберите папку проекта.")
-            self.log.append("[ERROR] Проект не выбран.")
+            self.add_log("[ERROR] Проект не выбран.")
             return
 
         if not self.export_path:
             self.statusBar().showMessage("Выберите папку для TXT.")
-            self.log.append("[ERROR] Папка для TXT не выбрана.")
+            self.add_log("[ERROR] Папка для TXT не выбрана.")
             return
 
         files = self._collect_selected_files()
         if not files:
             self.statusBar().showMessage("Нет выбранных файлов для экспорта.")
-            self.log.append("[WARN] Нет выбранных файлов.")
+            self.add_log("[WARN] Нет выбранных файлов.")
             return
 
         groups: dict[str, list[tuple[str, str]]] = {}
@@ -643,18 +794,13 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         done_files = 0
 
-        self.log.append(
+        self.add_log(
             f"[INFO] Экспорт (по папкам). Групп: {len(groups)}, файлов: {total_files}."
         )
 
         for dir_key, file_list in groups.items():
             group_filename = self._make_group_filename(dir_key)
             target_path = os.path.join(self.export_path, group_filename)
-
-            self.log.append(
-                f"[INFO] Группа '{dir_key or '(корень проекта)'}' → {group_filename} "
-                f"({len(file_list)} файлов)."
-            )
 
             try:
                 with open(target_path, "w", encoding="utf-8") as out:
@@ -676,46 +822,32 @@ class MainWindow(QMainWindow):
                         self.progress.setValue(done_files)
                         QApplication.processEvents()
 
-                        out.write(rel_unix + "\n\n")
-
-                        content, is_binary = self._read_file_safe(abs_path)
-                        out.write(content)
-
-                        if index != len(file_list) - 1:
-                            out.write("\n\n" + "-" * 80 + "\n\n")
-
-                        done_files += 1
-                        self.progress.setValue(done_files)
-                        QApplication.processEvents()
             except OSError as e:
-                self.log.append(f"[ERROR] Не удалось записать '{target_path}': {e}")
+                self.add_log(f"[ERROR] Не удалось записать '{target_path}': {e}")
 
         self.progress.setValue(self.progress.maximum())
         msg = (
             f"Экспорт по папкам завершён. TXT файлов: {len(groups)}, файлов внутри: {done_files}."
         )
         self.statusBar().showMessage(msg)
-        self.log.append("[INFO] " + msg)
+        self.add_log("[INFO] " + msg)
 
     # -----------------------
     # ЭКСПОРТ — В ОДИН ФАЙЛ
     # -----------------------
 
-    def start_export_single(self) -> None:
+    def start_export_single(self, is_auto: bool = False) -> None:
         if not self.project_path:
             self.statusBar().showMessage("Сначала выберите папку проекта.")
-            self.log.append("[ERROR] Проект не выбран (один файл).")
             return
 
         if not self.export_path:
             self.statusBar().showMessage("Выберите папку для TXT.")
-            self.log.append("[ERROR] Папка для TXT не выбрана (один файл).")
             return
 
         files = self._collect_selected_files()
         if not files:
             self.statusBar().showMessage("Нет выбранных файлов для экспорта.")
-            self.log.append("[WARN] Нет выбранных файлов (один файл).")
             return
 
         files_sorted = sorted(files, key=lambda x: x[0])
@@ -728,14 +860,12 @@ class MainWindow(QMainWindow):
         target_name = project_name + "_all.txt"
         target_path = os.path.join(self.export_path, target_name)
 
-        self.log.append(
-            f"[INFO] Экспорт в один файл: {target_name} (файлов: {total_files})."
-        )
+        if not is_auto:
+            self.add_log(f"[INFO] Экспорт в один файл: {target_name} (файлов: {total_files}).")
 
         done_files = 0
         try:
             with open(target_path, "w", encoding="utf-8") as out:
-                # шапка для нейросети (главное именно здесь, для общего файла)
                 self._write_export_header(out)
 
                 for index, (rel_path, abs_path) in enumerate(files_sorted):
@@ -750,23 +880,22 @@ class MainWindow(QMainWindow):
 
                     done_files += 1
                     self.progress.setValue(done_files)
-                    QApplication.processEvents()
-
-                    done_files += 1
-                    self.progress.setValue(done_files)
-                    QApplication.processEvents()
+                    
+                    if not is_auto:
+                        QApplication.processEvents()
         except OSError as e:
-            self.log.append(f"[ERROR] Не удалось записать '{target_path}': {e}")
+            self.add_log(f"[ERROR] Не удалось записать '{target_path}': {e}")
             self.statusBar().showMessage("Ошибка записи TXT.")
             return
 
         self.progress.setValue(self.progress.maximum())
-        msg = (
-            f"Экспорт в один файл завершён. Файлов внутри: {done_files}. "
-            f"Файл: {target_name}"
-        )
+        msg = f"Экспорт в один файл завершён. Файлов: {done_files}."
+        
         self.statusBar().showMessage(msg)
-        self.log.append("[INFO] " + msg)
+        if is_auto:
+             self.add_log(f"[AUTO] ✅ Файл обновлен: {target_name}")
+        else:
+             self.add_log(f"[INFO] {msg}")
 
 
 # -----------------------
@@ -779,6 +908,7 @@ def setup_dark_theme(app: QApplication) -> None:
     bg = QColor("#2E3440")
     fg = QColor("#ECEFF4")
     accent = QColor("#20C997")
+    danger = QColor("#BF616A") # Nord Red для кнопки стоп
 
     palette = QPalette()
     palette.setColor(QPalette.Window, bg)
@@ -804,6 +934,30 @@ def setup_dark_theme(app: QApplication) -> None:
         QMainWindow {{
             background-color: {bg.name()};
         }}
+        
+        /* SCROLLBAR STYLING */
+        QScrollBar:vertical {{
+            border: none;
+            background: #2E3440;
+            width: 10px;
+            margin: 0px 0px 0px 0px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: #4C566A;
+            min-height: 20px;
+            border-radius: 5px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background: #5E81AC;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+            background: none;
+        }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+            background: none;
+        }}
+        /* END SCROLLBAR */
 
         #HeaderSubtitle {{
             color: #B5BDC5;
@@ -868,6 +1022,16 @@ def setup_dark_theme(app: QApplication) -> None:
             background-color: #3B4252;
             color: #6B7280;
             border: 1px solid #4C566A;
+        }}
+        
+        QPushButton[accent_danger="true"] {{
+            background-color: {danger.name()};
+            color: #FFF;
+            border: none;
+            font-weight: bold;
+        }}
+        QPushButton[accent_danger="true"]:hover {{
+            background-color: #D08770;
         }}
 
         QPushButton[secondary="true"] {{
